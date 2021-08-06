@@ -5,40 +5,55 @@
 
 from pathlib import Path
 import logging
-import math
 import argparse
+import abc
 
 import cv2
 import numpy as np
 
 from objloader_simple import OBJ
+from keypoint_detector import OrbKeypointDetector, SiftKeypointDetector
+from keypoint_matcher import BfKeypointMatcher, FlannKeypointMatcher
 
 # Minimum number of matches that have to be found to consider the recognition valid
-MIN_MATCHES = 10
+MIN_MATCHES = 3
+# Monocolor of the 3d AR object displayed
 DEFAULT_COLOR = (50, 50, 50)
 
-logging.basicConfig(level=logging.INFO, format='%{message}s')
+logging.basicConfig(level=logging.DEBUG, format='%(message)s')
 
 class Frame:
-    def __init__(self, image, keypoint_detector_and_descriptor):
+    def __init__(self, image, keypoint_detector):
         self.frame = image
         self.keypoints = None
         self.descriptors = None
         # Compute model keypoints and its descriptors
-        self.keypoints, self.descriptors = keypoint_detector_and_descriptor.detectAndCompute(image, None)
+        self.keypoints, self.descriptors = keypoint_detector.detect_and_compute(image)
 
 class ARObject(Frame):
-    def __init__(self, reference_image_2d, keypoint_detector_and_descriptor, object_3d):
-        super().__init__(reference_image_2d, keypoint_detector_and_descriptor)
+    def __init__(self, reference_image_2d, keypoint_detector, object_3d):
+        super().__init__(reference_image_2d, keypoint_detector)
         self.object = object_3d
+
+def draw_matches(frame_from, frame_to, matches):
+    """
+    helper function for debugging
+    """
+    img1 = frame_from.frame
+    keypoints1 = frame_from.keypoints
+    img2 = frame_to.frame
+    keypoints2 = frame_to.keypoints
+    img_match = np.empty((img1.shape[0], img1.shape[1], 3), dtype=np.uint8)
+    cv2.drawMatches(img1, keypoints1, img2, keypoints2, matches, outImg=img_match, matchColor=None, flags=0)
+    cv2.imshow("matches", img_match)
+    cv2.waitKey(0)
+
 
 def find_homography(feature_matcher, frame_from, frame_to):
     # match frame descriptors with model descriptors
     try:
         matches = feature_matcher.match(frame_from.descriptors, frame_to.descriptors)
-        # sort them in the order of their distance
-        # the lower the distance, the better the match
-        matches = sorted(matches, key=lambda x: x.distance)
+        logging.debug(f'{len(matches)} matches found')
     except cv2.error:
         logging.warn('Failed to match features')
         matches = list()
@@ -63,7 +78,7 @@ def augment_frame(frame, ar_object, camera_parametrs, feature_matcher):
             # obtain 3D projection matrix from homography matrix and camera parameters
             projection = projection_matrix(camera_parameters, homography)
             # project cube or model
-            frame = render(frame.frame, ar_object.object, projection, ar_object.frame, False)
+            frame = render(frame.frame, ar_object.object, projection, ar_object.frame)
         except ValueError:
             logging.warn('Failed to project object onto frame')
     else:
@@ -74,17 +89,20 @@ def draw_rectangle_around_found_model(frame, model, homography):
     h, w, _ = model.shape
     pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
     # project corners into frame
-    dst = cv2.perspectiveTransform(pts, homography)
-    # connect them with lines  
-    frame = cv2.polylines(frame, [np.int32(dst)], True, 255, 3, cv2.LINE_AA)
+    try:
+        dst = cv2.perspectiveTransform(pts, homography)
+        # connect them with lines  
+        frame = cv2.polylines(frame, [np.int32(dst)], True, 255, 3, cv2.LINE_AA)
+    except cv2.error:
+        logging.warn('Failed to draw bounding rectangle')
     return frame
 
-def render(frame, obj, projection, model, color=False):
+def render(frame, obj, projection, model, scale=3, color=False):
     """
     Render a loaded obj model into the current video frame
     """
     vertices = obj.vertices
-    scale_matrix = np.eye(3) * 3
+    scale_matrix = np.eye(3) * scale
     h, w, _ = model.shape
 
     for face in obj.faces:
@@ -94,14 +112,17 @@ def render(frame, obj, projection, model, color=False):
         # render model in the middle of the reference surface. To do so,
         # model points must be displaced
         points = np.array([[p[0] + w / 2, p[1] + h / 2, p[2]] for p in points])
-        dst = cv2.perspectiveTransform(points.reshape(-1, 1, 3), projection)
-        imgpts = np.int32(dst)
-        if color is False:
-            cv2.fillConvexPoly(frame, imgpts, DEFAULT_COLOR)
-        else:
-            color = hex_to_rgb(face[-1])
-            color = color[::-1]  # reverse
-            cv2.fillConvexPoly(frame, imgpts, color)
+        try:
+            dst = cv2.perspectiveTransform(points.reshape(-1, 1, 3), projection)
+            imgpts = np.int32(dst)
+            if color is False:
+                cv2.fillConvexPoly(frame, imgpts, DEFAULT_COLOR)
+            else:
+                color = hex_to_rgb(face[-1])
+                color = color[::-1]  # reverse
+                cv2.fillConvexPoly(frame, imgpts, color)
+        except cv2.error:
+            logging.warn('Failed to project the objecto onto frame')
 
     return frame
 
@@ -117,7 +138,7 @@ def projection_matrix(camera_parameters, homography):
     col_2 = rot_and_transl[:, 1]
     col_3 = rot_and_transl[:, 2]
     # normalise vectors
-    l = math.sqrt(np.linalg.norm(col_1, 2) * np.linalg.norm(col_2, 2))
+    l = np.sqrt(np.linalg.norm(col_1, 2) * np.linalg.norm(col_2, 2))
     rot_1 = col_1 / l
     rot_2 = col_2 / l
     translation = col_3 / l
@@ -125,8 +146,8 @@ def projection_matrix(camera_parameters, homography):
     c = rot_1 + rot_2
     p = np.cross(rot_1, rot_2)
     d = np.cross(c, p)
-    rot_1 = np.dot(c / np.linalg.norm(c, 2) + d / np.linalg.norm(d, 2), 1 / math.sqrt(2))
-    rot_2 = np.dot(c / np.linalg.norm(c, 2) - d / np.linalg.norm(d, 2), 1 / math.sqrt(2))
+    rot_1 = np.dot(c / np.linalg.norm(c, 2) + d / np.linalg.norm(d, 2), 1 / np.sqrt(2))
+    rot_2 = np.dot(c / np.linalg.norm(c, 2) - d / np.linalg.norm(d, 2), 1 / np.sqrt(2))
     rot_3 = np.cross(rot_1, rot_2)
     # finally, compute the 3D projection matrix from the model to the current frame
     projection = np.stack((rot_1, rot_2, rot_3, translation)).T
@@ -162,13 +183,13 @@ if __name__ == '__main__':
     obj_3d_path = obj_3d_path.resolve()
     obj_3d = OBJ(obj_3d_path, swapyz=True)
 
-    # create ORB keypoint detector
-    keypoint_detector_and_descriptor = cv2.ORB_create()
+    #keypoint_detector = OrbKeypointDetector()
+    #feature_matcher = BfKeypointMatcher()
+    keypoint_detector = SiftKeypointDetector()
+    feature_matcher = FlannKeypointMatcher()
+    
+    ar_object = ARObject(reference_image_2d, keypoint_detector, obj_3d)
 
-    ar_object = ARObject(reference_image_2d, keypoint_detector_and_descriptor, obj_3d)
-
-    # create BFMatcher object based on hamming distance
-    feature_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
     if use_webcam_not_image:
         # init video captureG
@@ -177,7 +198,7 @@ if __name__ == '__main__':
             raise IOError("Cannot open webcam")
         while True:
             _, frame_image = cap.read()
-            frame = Frame(frame_image, keypoint_detector_and_descriptor)
+            frame = Frame(frame_image, keypoint_detector)
             augment_frame(frame, ar_object, camera_parameters, feature_matcher)
             cv2.imshow('frame', frame.frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -188,7 +209,7 @@ if __name__ == '__main__':
         image_2d_path = Path(args.img)
         image_2d_path = image_2d_path.resolve()
         image_2d = cv2.imread(str(image_2d_path))
-        frame = Frame(image_2d, keypoint_detector_and_descriptor)
+        frame = Frame(image_2d, keypoint_detector)
         augment_frame(frame, ar_object, camera_parameters, feature_matcher)
         cv2.imshow('frame', frame.frame)
         if cv2.waitKey(0) & 0xFF == ord('q'):
