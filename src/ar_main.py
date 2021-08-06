@@ -1,108 +1,91 @@
-
 # Useful links
 # http://www.pygame.org/wiki/OBJFileLoader
 # https://rdmilligan.wordpress.com/2015/10/15/augmented-reality-using-opencv-opengl-and-blender/
 # https://clara.io/library
 
-# TODO -> Implement command line arguments (scale, model and object to be projected)
-#      -> Refactor and organize code (proper funcition definition and separation, classes, error handling...)
-
+from pathlib import Path
+import logging
+import math
 import argparse
 
 import cv2
 import numpy as np
-import math
-import os
-from objloader_simple import *
 
-# Minimum number of matches that have to be found
-# to consider the recognition valid
+from objloader_simple import OBJ
+
+# Minimum number of matches that have to be found to consider the recognition valid
 MIN_MATCHES = 10
-DEFAULT_COLOR = (0, 0, 0)
+DEFAULT_COLOR = (50, 50, 50)
 
+logging.basicConfig(level=logging.INFO, format='%{message}s')
 
-def main():
-    """
-    This functions loads the target surface image,
-    """
-    homography = None 
-    # matrix of camera parameters (made up but works quite well for me) 
-    camera_parameters = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1]])
-    # create ORB keypoint detector
-    orb = cv2.ORB_create()
-    # create BFMatcher object based on hamming distance  
-    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-    # load the reference surface that will be searched in the video stream
-    dir_name = os.getcwd()
-    model = cv2.imread(os.path.join(dir_name, 'reference/model.jpg'), 0)
-    # Compute model keypoints and its descriptors
-    kp_model, des_model = orb.detectAndCompute(model, None)
-    # Load 3D model from OBJ file
-    obj = OBJ(os.path.join(dir_name, 'models/fox.obj'), swapyz=True)  
-    # init video capture
-    cap = cv2.VideoCapture(0)
+class Frame:
+    def __init__(self, image, keypoint_detector_and_descriptor):
+        self.frame = image
+        self.keypoints = None
+        self.descriptors = None
+        # Compute model keypoints and its descriptors
+        self.keypoints, self.descriptors = keypoint_detector_and_descriptor.detectAndCompute(image, None)
 
-    while True:
-        # read the current frame
-        ret, frame = cap.read()
-        if not ret:
-            print("Unable to capture video")
-            return 
-        # find and draw the keypoints of the frame
-        kp_frame, des_frame = orb.detectAndCompute(frame, None)
-        # match frame descriptors with model descriptors
-        matches = bf.match(des_model, des_frame)
+class ARObject(Frame):
+    def __init__(self, reference_image_2d, keypoint_detector_and_descriptor, object_3d):
+        super().__init__(reference_image_2d, keypoint_detector_and_descriptor)
+        self.object = object_3d
+
+def find_homography(feature_matcher, frame_from, frame_to):
+    # match frame descriptors with model descriptors
+    try:
+        matches = feature_matcher.match(frame_from.descriptors, frame_to.descriptors)
         # sort them in the order of their distance
         # the lower the distance, the better the match
         matches = sorted(matches, key=lambda x: x.distance)
+    except cv2.error:
+        logging.warn('Failed to match features')
+        matches = list()
 
-        # compute Homography if enough matches are found
-        if len(matches) > MIN_MATCHES:
-            # differenciate between source points and destination points
-            src_pts = np.float32([kp_model[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
-            dst_pts = np.float32([kp_frame[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
-            # compute Homography
-            homography, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, 5.0)
-            if args.rectangle:
-                # Draw a rectangle that marks the found model in the frame
-                h, w = model.shape
-                pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
-                # project corners into frame
-                dst = cv2.perspectiveTransform(pts, homography)
-                # connect them with lines  
-                frame = cv2.polylines(frame, [np.int32(dst)], True, 255, 3, cv2.LINE_AA)  
-            # if a valid homography matrix was found render cube on model plane
-            if homography is not None:
-                try:
-                    # obtain 3D projection matrix from homography matrix and camera parameters
-                    projection = projection_matrix(camera_parameters, homography)  
-                    # project cube or model
-                    frame = render(frame, obj, projection, model, False)
-                    #frame = render(frame, model, projection)
-                except:
-                    pass
-            # draw first 10 matches.
-            if args.matches:
-                frame = cv2.drawMatches(model, kp_model, frame, kp_frame, matches[:10], 0, flags=2)
-            # show result
-            cv2.imshow('frame', frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+    if len(matches) > MIN_MATCHES:
+        # differenciate between source points and destination points
+        pts_from = np.float32([frame_from.keypoints[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+        pts_to = np.float32([frame_to.keypoints[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+        # compute Homography
+        homography, _ = cv2.findHomography(pts_from, pts_to, cv2.RANSAC, 5.0)
+        return True, homography
+    else:
+        logging.warn(f'Not enough matches found - {len(matches)}/{MIN_MATCHES}')
+        return False, None
 
-        else:
-            print("Not enough matches found - %d/%d" % (len(matches), MIN_MATCHES))
+def augment_frame(frame, ar_object, camera_parametrs, feature_matcher):
+    homography_found, homography = find_homography(feature_matcher, ar_object, frame)
+    if homography_found:
+        frame.frame = draw_rectangle_around_found_model(frame.frame, ar_object.frame, homography)
+        # if a valid homography matrix was found render cube on model plane
+        try:
+            # obtain 3D projection matrix from homography matrix and camera parameters
+            projection = projection_matrix(camera_parameters, homography)
+            # project cube or model
+            frame = render(frame.frame, ar_object.object, projection, ar_object.frame, False)
+        except ValueError:
+            logging.warn('Failed to project object onto frame')
+    else:
+        logging.warn('Failed to find homography')
 
-    cap.release()
-    cv2.destroyAllWindows()
-    return 0
+def draw_rectangle_around_found_model(frame, model, homography):
+    # Draw a rectangle that marks the found model in the frame
+    h, w, _ = model.shape
+    pts = np.float32([[0, 0], [0, h - 1], [w - 1, h - 1], [w - 1, 0]]).reshape(-1, 1, 2)
+    # project corners into frame
+    dst = cv2.perspectiveTransform(pts, homography)
+    # connect them with lines  
+    frame = cv2.polylines(frame, [np.int32(dst)], True, 255, 3, cv2.LINE_AA)
+    return frame
 
-def render(img, obj, projection, model, color=False):
+def render(frame, obj, projection, model, color=False):
     """
     Render a loaded obj model into the current video frame
     """
     vertices = obj.vertices
     scale_matrix = np.eye(3) * 3
-    h, w = model.shape
+    h, w, _ = model.shape
 
     for face in obj.faces:
         face_vertices = face[0]
@@ -114,13 +97,13 @@ def render(img, obj, projection, model, color=False):
         dst = cv2.perspectiveTransform(points.reshape(-1, 1, 3), projection)
         imgpts = np.int32(dst)
         if color is False:
-            cv2.fillConvexPoly(img, imgpts, DEFAULT_COLOR)
+            cv2.fillConvexPoly(frame, imgpts, DEFAULT_COLOR)
         else:
             color = hex_to_rgb(face[-1])
             color = color[::-1]  # reverse
-            cv2.fillConvexPoly(img, imgpts, color)
+            cv2.fillConvexPoly(frame, imgpts, color)
 
-    return img
+    return frame
 
 def projection_matrix(camera_parameters, homography):
     """
@@ -157,19 +140,56 @@ def hex_to_rgb(hex_color):
     h_len = len(hex_color)
     return tuple(int(hex_color[i:i + h_len // 3], 16) for i in range(0, h_len, h_len // 3))
 
-
-# Command line argument parsing
-# NOT ALL OF THEM ARE SUPPORTED YET
-parser = argparse.ArgumentParser(description='Augmented reality application')
-
-parser.add_argument('-r','--rectangle', help = 'draw rectangle delimiting target surface on frame', action = 'store_true')
-parser.add_argument('-mk','--model_keypoints', help = 'draw model keypoints', action = 'store_true')
-parser.add_argument('-fk','--frame_keypoints', help = 'draw frame keypoints', action = 'store_true')
-parser.add_argument('-ma','--matches', help = 'draw matches between keypoints', action = 'store_true')
-# TODO jgallostraa -> add support for model specification
-#parser.add_argument('-mo','--model', help = 'Specify model to be projected', action = 'store_true')
-
-args = parser.parse_args()
-
 if __name__ == '__main__':
-    main()
+    # matrix of camera parameters (made up but works quite well for me); hardcoded
+    camera_parameters = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1]])
+
+    parser = argparse.ArgumentParser('REF and OBJ + --video or IMG. camera parameters are currently hardcoded')
+    parser.add_argument('-r', '--ref', help='path to the 2d reference image file', type=str)
+    parser.add_argument('-o', '--obj', help='path to the .obj file of a 3d object model', type=str)
+    parser.add_argument('-v', '--video', action='store_true', default=False, help='if present; the webcam stream is used. Otherwise a path to an image file must be provided')
+    parser.add_argument('-i', '--img', help='path to the 2d image file, e.g. rotated version of refernce', type=str)
+    args = parser.parse_args()
+    use_webcam_not_image = args.video
+
+    # load the reference surface that will be searched in the video stream
+    reference_image_2d_path = Path(args.ref)
+    reference_image_2d_path = reference_image_2d_path.resolve()
+    reference_image_2d = cv2.imread(str(reference_image_2d_path))
+
+    # Load 3D model from OBJ file
+    obj_3d_path = Path(args.obj)
+    obj_3d_path = obj_3d_path.resolve()
+    obj_3d = OBJ(obj_3d_path, swapyz=True)
+
+    # create ORB keypoint detector
+    keypoint_detector_and_descriptor = cv2.ORB_create()
+
+    ar_object = ARObject(reference_image_2d, keypoint_detector_and_descriptor, obj_3d)
+
+    # create BFMatcher object based on hamming distance
+    feature_matcher = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+
+    if use_webcam_not_image:
+        # init video captureG
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            raise IOError("Cannot open webcam")
+        while True:
+            _, frame_image = cap.read()
+            frame = Frame(frame_image, keypoint_detector_and_descriptor)
+            augment_frame(frame, ar_object, camera_parameters, feature_matcher)
+            cv2.imshow('frame', frame.frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+        cap.release()
+        cv2.destroyAllWindows()
+    else:
+        image_2d_path = Path(args.img)
+        image_2d_path = image_2d_path.resolve()
+        image_2d = cv2.imread(str(image_2d_path))
+        frame = Frame(image_2d, keypoint_detector_and_descriptor)
+        augment_frame(frame, ar_object, camera_parameters, feature_matcher)
+        cv2.imshow('frame', frame.frame)
+        if cv2.waitKey(0) & 0xFF == ord('q'):
+            pass
