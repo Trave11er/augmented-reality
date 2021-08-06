@@ -145,10 +145,10 @@ if __name__ == '__main__':
     camera_parameters = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1]])
 
     parser = argparse.ArgumentParser('REF and OBJ + --video or IMG. camera parameters are currently hardcoded')
-    parser.add_argument('-r', '--ref', help='path to the 2d reference image file', type=str)
-    parser.add_argument('-o', '--obj', help='path to the .obj file of a 3d object model', type=str)
+    parser.add_argument('-r', '--ref', default='./reference/reference.jpg', help='path to the 2d reference image file', type=str)
+    parser.add_argument('-o', '--obj', default='./models/fox.obj', help='path to the .obj file of a 3d object model', type=str)
     parser.add_argument('-v', '--video', action='store_true', default=False, help='if present; the webcam stream is used. Otherwise a path to an image file must be provided')
-    parser.add_argument('-i', '--img', help='path to the 2d image file, e.g. rotated version of refernce', type=str)
+    parser.add_argument('-i', '--img', default='./reference/reference_rot.jpg', help='path to the 2d image file, e.g. rotated version of refernce', type=str)
     args = parser.parse_args()
     use_webcam_not_image = args.video
 
