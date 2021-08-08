@@ -14,6 +14,7 @@ import numpy as np
 from objloader_simple import OBJ
 from keypoint_detector import OrbKeypointDetector, SiftKeypointDetector
 from keypoint_matcher import BfKeypointMatcher, FlannKeypointMatcher
+from frame import Frame, ARObject
 
 # Minimum number of matches that have to be found to consider the recognition valid
 MIN_MATCHES = 3
@@ -22,18 +23,6 @@ DEFAULT_COLOR = (50, 50, 50)
 
 logging.basicConfig(level=logging.DEBUG, format='%(message)s')
 
-class Frame:
-    def __init__(self, image, keypoint_detector):
-        self.frame = image
-        self.keypoints = None
-        self.descriptors = None
-        # Compute model keypoints and its descriptors
-        self.keypoints, self.descriptors = keypoint_detector.detect_and_compute(image)
-
-class ARObject(Frame):
-    def __init__(self, reference_image_2d, keypoint_detector, object_3d):
-        super().__init__(reference_image_2d, keypoint_detector)
-        self.object = object_3d
 
 def draw_matches(frame_from, frame_to, matches):
     """
@@ -123,7 +112,6 @@ def render(frame, obj, projection, model, scale=3, color=False):
                 cv2.fillConvexPoly(frame, imgpts, color)
         except cv2.error:
             logging.warn('Failed to project the objecto onto frame')
-
     return frame
 
 def projection_matrix(camera_parameters, homography):
@@ -166,32 +154,41 @@ if __name__ == '__main__':
     camera_parameters = np.array([[800, 0, 320], [0, 800, 240], [0, 0, 1]])
 
     parser = argparse.ArgumentParser('REF and OBJ + --video or IMG. camera parameters are currently hardcoded')
-    parser.add_argument('-r', '--ref', default='./reference/reference.jpg', help='path to the 2d reference image file', type=str)
-    parser.add_argument('-o', '--obj', default='./models/fox.obj', help='path to the .obj file of a 3d object model', type=str)
-    parser.add_argument('-v', '--video', action='store_true', default=False, help='if present; the webcam stream is used. Otherwise a path to an image file must be provided')
-    parser.add_argument('-i', '--img', default='./reference/reference_rot.jpg', help='path to the 2d image file, e.g. rotated version of refernce', type=str)
+    parser.add_argument('-r', '--ref', nargs='+', default=['./reference/reference_0.jpg'], help='path to 1..N 2d reference image files', type=str)
+    parser.add_argument('-o', '--obj', nargs='+', default=['./models/fox.obj'], help='path to 1..N .obj files of a 3d object models', type=str)
+    parser.add_argument('-v', '--video', action='store_true', default=False, help='if present; the webcam stream is used. Otherwise a path to an image file must be provided.')
+    parser.add_argument('-i', '--img', default='./reference/reference_0_rot.jpg', help='path to the 2d image file. Treated same way as a single frame of video.', type=str)
     args = parser.parse_args()
-    use_webcam_not_image = args.video
+    if len(args.ref) != len(args.obj):
+        raise ValueError('Please pass equal number of references and objects')
 
     # load the reference surface that will be searched in the video stream
-    reference_image_2d_path = Path(args.ref)
-    reference_image_2d_path = reference_image_2d_path.resolve()
-    reference_image_2d = cv2.imread(str(reference_image_2d_path))
+    reference_image_2d_list = list()
+    for path in args.ref:
+        reference_image_2d_path = Path(path)
+        reference_image_2d_path = reference_image_2d_path.resolve()
+        reference_image_2d = cv2.imread(str(reference_image_2d_path))
+        reference_image_2d_list.append(reference_image_2d)
 
     # Load 3D model from OBJ file
-    obj_3d_path = Path(args.obj)
-    obj_3d_path = obj_3d_path.resolve()
-    obj_3d = OBJ(obj_3d_path, swapyz=True)
+    obj_3d_list = list()
+    for path in args.obj:
+        obj_3d_path = Path(path)
+        obj_3d_path = obj_3d_path.resolve()
+        obj_3d = OBJ(obj_3d_path, swapyz=True)
+        obj_3d_list.append(obj_3d)
 
     #keypoint_detector = OrbKeypointDetector()
     #feature_matcher = BfKeypointMatcher()
     keypoint_detector = SiftKeypointDetector()
     feature_matcher = FlannKeypointMatcher()
     
-    ar_object = ARObject(reference_image_2d, keypoint_detector, obj_3d)
+    ar_object_list = list()
+    for obj_3d, reference_image_2d in zip(obj_3d_list, reference_image_2d_list):
+        ar_object = ARObject(obj_3d, reference_image_2d, keypoint_detector)
+        ar_object_list.append(ar_object)
 
-
-    if use_webcam_not_image:
+    if args.video:
         # init video captureG
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
@@ -199,7 +196,8 @@ if __name__ == '__main__':
         while True:
             _, frame_image = cap.read()
             frame = Frame(frame_image, keypoint_detector)
-            augment_frame(frame, ar_object, camera_parameters, feature_matcher)
+            for ar_object in ar_object_list:
+                augment_frame(frame, ar_object, camera_parameters, feature_matcher)
             cv2.imshow('frame', frame.frame)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
@@ -210,7 +208,8 @@ if __name__ == '__main__':
         image_2d_path = image_2d_path.resolve()
         image_2d = cv2.imread(str(image_2d_path))
         frame = Frame(image_2d, keypoint_detector)
-        augment_frame(frame, ar_object, camera_parameters, feature_matcher)
+        for ar_object in ar_object_list:
+            augment_frame(frame, ar_object, camera_parameters, feature_matcher)
         cv2.imshow('frame', frame.frame)
         if cv2.waitKey(0) & 0xFF == ord('q'):
             pass
